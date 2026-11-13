@@ -45,6 +45,7 @@ import org.slf4j.LoggerFactory;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.UnaryOperator;
 import java.util.regex.Pattern;
@@ -62,13 +63,13 @@ public final class CsrfValidator {
     public boolean isValid(final HttpServletRequest request, final HttpServletResponse response) {
         final boolean isValid;
 
-        final String normalizedResourceURI = CsrfGuardUtils.normalizeResourceURI(request);
+        final Optional<String> canonicalResourceURI = CsrfGuardUtils.canonicalizeResourceURI(request);
         final ProtectionResult protectionResult = isProtectedPageAndMethod(request);
         if (protectionResult.isProtected()) {
-            LOGGER.debug("CSRFGuard analyzing protected resource: '{}'", normalizedResourceURI);
+            LOGGER.debug("CSRFGuard analyzing protected resource: '{}'", canonicalResourceURI.orElse(request.getRequestURI()));
             isValid = isTokenValidInRequest(request, response, protectionResult.getResourceIdentifier());
         } else {
-            LOGGER.debug("Unprotected page: '{}'", normalizedResourceURI);
+            LOGGER.debug("Unprotected page: '{}'", canonicalResourceURI.orElse(request.getRequestURI()));
             isValid = true;
         }
 
@@ -76,27 +77,53 @@ public final class CsrfValidator {
     }
 
     public ProtectionResult isProtectedPageAndMethod(final String page, final String method) {
-        final String normalizedResourceUri = CsrfGuardUtils.normalizeResourceURI(page);
-        final ProtectionResult protectionResult = isProtectedPage(normalizedResourceUri);
+        final Optional<String> canonicalResourceUri = CsrfGuardUtils.canonicalizeResourceURI(page);
+        final ProtectionResult protectionResult = isProtectedPage(canonicalResourceUri, page);
 
         return (protectionResult.isProtected() && isProtectedMethod(method)) ? protectionResult
-                                                                             : new ProtectionResult(false, normalizedResourceUri);
+                                                                             : new ProtectionResult(false, protectionResult.getResourceIdentifier());
     }
 
     public ProtectionResult isProtectedPage(final String normalizedResourceUri) {
+        return isProtectedPage(CsrfGuardUtils.canonicalizeResourceURI(normalizedResourceUri), normalizedResourceUri);
+    }
+
+    private ProtectionResult isProtectedPage(final Optional<String> canonicalResourceUri, final String rawResourceUri) {
         final ProtectionResult protectionResult;
 
-        if (JavaScriptServlet.getJavascriptUris().contains(normalizedResourceUri)) {
+        final String resourceIdentifier = canonicalResourceUri.orElse(rawResourceUri);
+
+        if (canonicalResourceUri.filter(uri -> JavaScriptServlet.getJavascriptUris().contains(uri)).isPresent()) {
             /* if this is a javascript page, let it go through */
-            protectionResult = new ProtectionResult(false, normalizedResourceUri);
+            protectionResult = new ProtectionResult(false, resourceIdentifier);
+        } else if (!canonicalResourceUri.isPresent()) {
+            /* the request path cannot be canonicalized (e.g. it escapes the context root): fail closed and require a token */
+            LOGGER.warn("The resource URI '{}' cannot be normalized, it is protected by default!", rawResourceUri);
+            protectionResult = new ProtectionResult(true, resourceIdentifier);
         } else if (this.csrfGuard.isProtectEnabled()) {
             /* all links are unprotected, except the ones that were explicitly specified */
-            protectionResult = isUriMatch(normalizedResourceUri, this.csrfGuard.getProtectedPages(), v -> v, false);
+            final String canonicalUri = canonicalResourceUri.get();
+            if (matchesAnyPage(canonicalUri, this.csrfGuard.getUnprotectedPages())) {
+                /* an explicit unprotected rule always takes precedence over the protected page rules */
+                protectionResult = new ProtectionResult(false, canonicalUri);
+            } else {
+                protectionResult = isUriMatch(canonicalUri, this.csrfGuard.getProtectedPages(), v -> v, false);
+            }
         } else {
             /* all links are protected, except the ones were explicitly excluded */
-            protectionResult = isUriMatch(normalizedResourceUri, this.csrfGuard.getUnprotectedPages(), v -> new ProtectionResult(false, v.getResourceIdentifier()), true);
+            final String canonicalUri = canonicalResourceUri.get();
+            if (matchesAnyPage(canonicalUri, this.csrfGuard.getProtectedPages())) {
+                /* an explicit protected rule always takes precedence over the unprotected page rules */
+                protectionResult = new ProtectionResult(true, canonicalUri);
+            } else {
+                protectionResult = isUriMatch(canonicalUri, this.csrfGuard.getUnprotectedPages(), v -> new ProtectionResult(false, v.getResourceIdentifier()), true);
+            }
         }
         return protectionResult;
+    }
+
+    private boolean matchesAnyPage(final String canonicalResourceUri, final Set<String> pages) {
+        return pages.stream().anyMatch(page -> isUriMatch(page, canonicalResourceUri).isProtected());
     }
 
     private static boolean isUriPathMatch(final String configuredPageUri, final String requestUri) {

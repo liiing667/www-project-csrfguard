@@ -43,10 +43,13 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.Charset;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Enumeration;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * Various utility methods/helpers.
@@ -140,6 +143,87 @@ public final class CsrfGuardUtils {
 
     public static String normalizeResourceURI(final String resourceURI) {
         return resourceURI.startsWith("/") ? resourceURI : '/' + resourceURI;
+    }
+
+    /**
+     * Canonicalizes the request URI of the given request before it is matched against the configured
+     * protected/unprotected page rules.
+     * <p>
+     * The canonicalization:
+     * <ul>
+     *     <li>discards the query string and the fragment (if any are present),</li>
+     *     <li>collapses sequences of duplicate slash characters into a single slash,</li>
+     *     <li>resolves {@code .} and {@code ..} path segments according to RFC 3986,</li>
+     *     <li>keeps the (case-sensitive) path characters, including file extensions, untouched.</li>
+     * </ul>
+     * As a consequence, aliases such as {@code //admin/./save} or {@code /admin//save} resolve to the same
+     * canonical path as the servlet they are routed to ({@code /admin/save}).
+     *
+     * @param httpServletRequest the current request
+     * @return the canonical request path, or an empty {@link Optional} when the path cannot be normalized
+     *         (for example it contains a {@code ..} segment escaping the servlet context root)
+     */
+    public static Optional<String> canonicalizeResourceURI(final HttpServletRequest httpServletRequest) {
+        return canonicalizeResourceURI(httpServletRequest.getRequestURI());
+    }
+
+    /**
+     * Canonicalizes the given resource URI before it is matched against the configured protected/unprotected
+     * page rules.
+     *
+     * @param resourceURI the raw resource URI, never {@code null}
+     * @return the canonical request path, or an empty {@link Optional} when the path cannot be normalized
+     * @see #canonicalizeResourceURI(HttpServletRequest)
+     */
+    public static Optional<String> canonicalizeResourceURI(final String resourceURI) {
+        if (Objects.isNull(resourceURI) || resourceURI.isEmpty()) {
+            return Optional.empty();
+        }
+
+        final String path = normalizeResourceURI(stripQueryAndFragment(resourceURI));
+        final String[] segments = path.split("/", -1);
+        final Deque<String> canonicalSegments = new ArrayDeque<>();
+
+        for (int i = 0; i < segments.length; i++) {
+            final String segment = segments[i];
+            if (i == 0) {
+                // the first segment is empty for absolute paths and must not be treated as a path element
+                continue;
+            }
+            if (segment.isEmpty() || ".".equals(segment)) {
+                // duplicate slashes and current-directory references are dropped
+                continue;
+            }
+            if ("..".equals(segment)) {
+                if (canonicalSegments.isEmpty()) {
+                    // the path tries to escape the context root, it cannot be represented canonically
+                    return Optional.empty();
+                }
+                canonicalSegments.removeLast();
+            } else {
+                canonicalSegments.addLast(segment);
+            }
+        }
+
+        final StringBuilder canonicalPath = new StringBuilder();
+        for (final String segment : canonicalSegments) {
+            canonicalPath.append('/').append(segment);
+        }
+
+        return Optional.of(canonicalPath.length() == 0 ? "/" : canonicalPath.toString());
+    }
+
+    private static String stripQueryAndFragment(final String resourceURI) {
+        int end = resourceURI.length();
+        final int queryIndex = resourceURI.indexOf('?');
+        if (queryIndex >= 0 && queryIndex < end) {
+            end = queryIndex;
+        }
+        final int fragmentIndex = resourceURI.indexOf('#');
+        if (fragmentIndex >= 0 && fragmentIndex < end) {
+            end = fragmentIndex;
+        }
+        return resourceURI.substring(0, end);
     }
 
     public static String readInputStreamContent(final InputStream inputStream) {
